@@ -4,8 +4,8 @@ import express from "express";
 import { promises as fs } from "fs";
 import crypto from "crypto";
 
-// Generated Bale bot - Phase 68
-// Real menu-based Bale bot with clean customer/admin panels and resilient update parsing.
+// Generated Bale bot - Phase 69
+// Real menu-based Bale bot with cleaner admin UX, card-to-card payment, cancel/back controls and copy-friendly claim flow.
 
 type StoredUser = { id: string; chatId: string; firstName?: string; username?: string; phone?: string; lastSeen: string; createdAt?: string };
 type Ticket = { id: string; userId: string; chatId: string; text: string; status: "OPEN" | "ANSWERED" | "CLOSED"; createdAt: string; updatedAt?: string; adminReply?: string };
@@ -15,7 +15,7 @@ type FormResponse = { id: string; userId: string; chatId: string; questions: str
 type Reservation = { id: string; userId: string; chatId: string; service: string; requestedTime: string; contact: string; status: "NEW" | "CONFIRMED" | "REJECTED" | "DONE" | "CANCELED"; createdAt: string };
 type MediaItem = { id: string; title: string; category?: string; url?: string; description?: string; active: boolean; createdAt: string };
 type BroadcastLog = { text: string; sentAt: string; count: number };
-type Session = { mode: "SUPPORT" | "FORM" | "RESERVATION" | "ORDER" | "ADD_ITEM" | "ADD_MEDIA" | "SEARCH" | "EDIT_WELCOME" | "EDIT_ABOUT" | "BROADCAST" | "ADD_ADMIN" | "REPLY_TICKET" | "DELETE_USER" | "DELETE_ITEM"; step: number; answers: string[]; meta?: Record<string, string> };
+type Session = { mode: "SUPPORT" | "FORM" | "RESERVATION" | "ORDER" | "ADD_ITEM" | "ADD_MEDIA" | "SEARCH" | "EDIT_WELCOME" | "EDIT_ABOUT" | "BROADCAST" | "ADD_ADMIN" | "REPLY_TICKET" | "DELETE_USER" | "DELETE_ITEM" | "SET_CARD"; step: number; answers: string[]; meta?: Record<string, string> };
 type Settings = {
   businessName: string;
   welcomeMessage: string;
@@ -35,6 +35,7 @@ type Settings = {
   broadcasts: BroadcastLog[];
   faq: string[];
   quickReplies: string[];
+  payment: { cardNumber: string; cardHolder: string; note: string };
 };
 
 const BUSINESS_NAME = "تنیتاستس";
@@ -218,7 +219,12 @@ function defaultSettings(): Settings {
     mediaItems: [],
     broadcasts: [],
     faq: defaultFaq(),
-    quickReplies: ["درخواست شما دریافت شد و در حال بررسی است.", "لطفاً شماره تماس و جزئیات بیشتر را ارسال کنید.", "پاسخ شما ثبت شد؛ اگر سوال دیگری دارید پیام بدهید."]
+    quickReplies: ["درخواست شما دریافت شد و در حال بررسی است.", "لطفاً شماره تماس و جزئیات بیشتر را ارسال کنید.", "پاسخ شما ثبت شد؛ اگر سوال دیگری دارید پیام بدهید."],
+    payment: {
+      cardNumber: String(process.env.CARD_NUMBER || "").trim(),
+      cardHolder: String(process.env.CARD_HOLDER || "").trim(),
+      note: String(process.env.CARD_NOTE || "بعد از کارت‌به‌کارت، رسید پرداخت را برای پشتیبانی ارسال کنید.").trim()
+    }
   };
 }
 async function loadSettings(): Promise<Settings> {
@@ -242,7 +248,11 @@ async function loadSettings(): Promise<Settings> {
       mediaItems: Array.isArray(parsed.mediaItems) ? parsed.mediaItems : [],
       broadcasts: Array.isArray(parsed.broadcasts) ? parsed.broadcasts : [],
       faq: Array.isArray(parsed.faq) && parsed.faq.length ? parsed.faq : base.faq,
-      quickReplies: Array.isArray(parsed.quickReplies) && parsed.quickReplies.length ? parsed.quickReplies : base.quickReplies
+      quickReplies: Array.isArray(parsed.quickReplies) && parsed.quickReplies.length ? parsed.quickReplies : base.quickReplies,
+      payment: {
+        ...base.payment,
+        ...(parsed.payment && typeof parsed.payment === "object" ? parsed.payment : {})
+      }
     };
   } catch {
     return defaultSettings();
@@ -301,7 +311,8 @@ function userRows(admin: boolean) {
   else if (TEMPLATE_CODE === "BALE_MEDIA_GALLERY" || TEMPLATE_CODE === "BALE_MEDIA") rows.push(["🎬 آرشیو رسانه", "🔍 جستجو"]);
   else if (TEMPLATE_CODE === "BALE_BROADCAST") rows.push(["🔔 عضویت اطلاع‌رسانی", "📞 پشتیبانی"]);
   else rows.push(["🎫 ثبت تیکت", "📚 سوالات متداول"]);
-  rows.push(["📞 پشتیبانی", "🆔 آیدی من"]);
+  rows.push(["💳 پرداخت", "📞 پشتیبانی"]);
+  rows.push(["🆔 آیدی من"]);
   if (admin) rows.push(["⚙️ پنل مدیریت"]);
   return rows;
 }
@@ -312,7 +323,8 @@ function adminRows() {
     ["📝 فرم‌ها", "📅 رزروها"],
     ["➕ افزودن محصول", "🗑 حذف محصول"],
     ["🎬 افزودن رسانه", "📨 پیام همگانی"],
-    ["✏️ تغییر خوش‌آمد", "➕ افزودن ادمین"],
+    ["💳 تنظیم کارت‌به‌کارت", "✏️ تغییر خوش‌آمد"],
+    ["➕ افزودن ادمین"],
     ["🗑 حذف کاربر", "🏠 منوی اصلی"]
   ];
 }
@@ -329,6 +341,28 @@ async function sendAdminPanel(user: any, settings: Settings) {
     "رزروها: " + settings.reservations.length + "\n\n" +
     "از دکمه‌ها یا شماره گزینه‌ها استفاده کنید.";
   await sendMenu(user.id, user.chatId, text, adminRows());
+}
+
+async function sendAdminAction(user: any, text: string) {
+  await sendMenu(user.id, user.chatId, text, adminRows());
+}
+function sessionRows(admin: boolean) {
+  return admin ? [["↩️ بازگشت", "❌ انصراف"], ["⚙️ پنل مدیریت", "🏠 منوی اصلی"]] : [["↩️ بازگشت", "❌ انصراف"], ["🏠 منوی اصلی"]];
+}
+async function sendSessionPrompt(user: any, text: string, admin: boolean) {
+  await sendMenu(user.id, user.chatId, text + "\n\nبرای لغو یا برگشت از دکمه‌های زیر استفاده کنید.", sessionRows(admin));
+}
+function paymentText(settings: Settings) {
+  const lines: string[] = ["💳 روش پرداخت"];
+  if (settings.payment.cardNumber) {
+    lines.push("", "کارت‌به‌کارت:", settings.payment.cardNumber);
+    if (settings.payment.cardHolder) lines.push("به نام: " + settings.payment.cardHolder);
+    if (settings.payment.note) lines.push("", settings.payment.note);
+  } else {
+    lines.push("", "اطلاعات کارت‌به‌کارت هنوز توسط مدیر ثبت نشده است.", "برای پرداخت یا دریافت شماره کارت با پشتیبانی تماس بگیرید.");
+  }
+  if (settings.supportContact && settings.supportContact !== "ثبت نشده") lines.push("", "پشتیبانی: " + settings.supportContact);
+  return lines.join("\n");
 }
 function pickMessage(update: any) {
   return update?.message || update?.edited_message || update?.data?.message || update?.result?.message || update?.callback_query?.message || update || {};
@@ -410,9 +444,9 @@ async function notifyAdmins(settings: Settings, text: string) {
 async function handleSession(settings: Settings, user: any, text: string, admin: boolean) {
   const session = sessions.get(user.id);
   if (!session) return false;
-  if (labelIs(text, "لغو", "/cancel", "انصراف")) {
+  if (labelIs(text, "لغو", "/cancel", "انصراف", "❌ انصراف", "↩️ بازگشت", "بازگشت")) {
     sessions.delete(user.id);
-    await sendUserMenu(user, settings, admin, "عملیات لغو شد.");
+    if (admin) await sendAdminAction(user, "عملیات لغو شد."); else await sendUserMenu(user, settings, admin, "عملیات لغو شد.");
     return true;
   }
   if (session.mode === "SUPPORT") {
@@ -462,7 +496,7 @@ async function handleSession(settings: Settings, user: any, text: string, admin:
     settings.shopOrders.push({ id: id, userId: user.id, chatId: user.chatId, itemTitle: item?.title || selected, qty: qty, contact: session.answers[2], note: session.answers[1], total: total, status: "NEW", createdAt: nowIso() });
     sessions.delete(user.id);
     await saveSettings(settings);
-    await sendUserMenu(user, settings, admin, "سفارش شما ثبت شد ✅\nکد سفارش: " + id + (total ? "\nمبلغ تقریبی: " + formatToman(total) : ""));
+    await sendUserMenu(user, settings, admin, "سفارش شما ثبت شد ✅\nکد سفارش: " + id + (total ? "\nمبلغ تقریبی: " + formatToman(total) : "") + "\n\n" + paymentText(settings));
     await notifyAdmins(settings, "سفارش جدید " + id + "\nکاربر: " + user.id + "\nآیتم: " + (item?.title || selected) + "\nتعداد/توضیح: " + session.answers[1] + "\nتماس: " + session.answers[2] + (total ? "\nمبلغ: " + formatToman(total) : ""));
     return true;
   }
@@ -476,16 +510,14 @@ async function handleSession(settings: Settings, user: any, text: string, admin:
     settings.items.push(parseItemLine(text));
     sessions.delete(user.id);
     await saveSettings(settings);
-    await sendAdminPanel(user, settings);
-    await sendMessage(user.chatId, "محصول/خدمت اضافه شد ✅");
+    await sendAdminAction(user, "محصول/خدمت اضافه شد ✅");
     return true;
   }
   if (session.mode === "ADD_MEDIA") {
     settings.mediaItems.push(parseMediaLine(text));
     sessions.delete(user.id);
     await saveSettings(settings);
-    await sendAdminPanel(user, settings);
-    await sendMessage(user.chatId, "رسانه/محتوا اضافه شد ✅");
+    await sendAdminAction(user, "رسانه/محتوا اضافه شد ✅");
     return true;
   }
   if (session.mode === "EDIT_WELCOME") {
@@ -500,6 +532,23 @@ async function handleSession(settings: Settings, user: any, text: string, admin:
     sessions.delete(user.id);
     await saveSettings(settings);
     await sendAdminPanel(user, settings);
+    return true;
+  }
+  if (session.mode === "SET_CARD") {
+    const value = compact(text);
+    if (/^(حذف|پاک|خاموش|off)$/i.test(value)) {
+      settings.payment.cardNumber = "";
+      settings.payment.cardHolder = "";
+      settings.payment.note = "بعد از پرداخت، رسید پرداخت را برای پشتیبانی ارسال کنید.";
+    } else {
+      const parts = value.split("|").map(function(p) { return compact(p); });
+      settings.payment.cardNumber = parts[0] || value;
+      settings.payment.cardHolder = parts.slice(1).join(" | ");
+      settings.payment.note = "بعد از کارت‌به‌کارت، رسید پرداخت را برای پشتیبانی ارسال کنید.";
+    }
+    sessions.delete(user.id);
+    await saveSettings(settings);
+    await sendAdminAction(user, "اطلاعات کارت‌به‌کارت ذخیره شد ✅\n\n" + paymentText(settings));
     return true;
   }
   if (session.mode === "BROADCAST") {
@@ -520,8 +569,7 @@ async function handleSession(settings: Settings, user: any, text: string, admin:
     if (!settings.admins.includes(id)) settings.admins.push(id);
     sessions.delete(user.id);
     await saveSettings(settings);
-    await sendAdminPanel(user, settings);
-    await sendMessage(user.chatId, "ادمین اضافه شد ✅\n" + id);
+    await sendAdminAction(user, "ادمین اضافه شد ✅\n" + id);
     return true;
   }
   if (session.mode === "REPLY_TICKET") {
@@ -534,8 +582,7 @@ async function handleSession(settings: Settings, user: any, text: string, admin:
     sessions.delete(user.id);
     await saveSettings(settings);
     await sendMessage(ticket.chatId || ticket.userId, "پاسخ پشتیبانی:\n" + text);
-    await sendAdminPanel(user, settings);
-    await sendMessage(user.chatId, "پاسخ ارسال شد ✅");
+    await sendAdminAction(user, "پاسخ ارسال شد ✅");
     return true;
   }
   if (session.mode === "DELETE_USER") {
@@ -544,8 +591,7 @@ async function handleSession(settings: Settings, user: any, text: string, admin:
     settings.users = settings.users.filter(function(u) { return String(u.id) !== id; });
     sessions.delete(user.id);
     await saveSettings(settings);
-    await sendAdminPanel(user, settings);
-    await sendMessage(user.chatId, before === settings.users.length ? "کاربر پیدا نشد." : "کاربر حذف شد ✅");
+    await sendAdminAction(user, before === settings.users.length ? "کاربر پیدا نشد." : "کاربر حذف شد ✅");
     return true;
   }
   if (session.mode === "DELETE_ITEM") {
@@ -554,8 +600,7 @@ async function handleSession(settings: Settings, user: any, text: string, admin:
     settings.items[n - 1].active = false;
     sessions.delete(user.id);
     await saveSettings(settings);
-    await sendAdminPanel(user, settings);
-    await sendMessage(user.chatId, "محصول/خدمت حذف شد ✅");
+    await sendAdminAction(user, "محصول/خدمت حذف شد ✅");
     return true;
   }
   return false;
@@ -580,10 +625,10 @@ async function handleUpdate(update: any) {
     await sendMessage(user.chatId, "مدیریت بازوی بله برای این حساب فعال شد ✅");
     return;
   }
-  if (cmd?.name === "/cancel" || labelIs(text, "انصراف", "لغو")) {
+  if (cmd?.name === "/cancel" || labelIs(text, "انصراف", "لغو", "❌ انصراف", "↩️ بازگشت", "بازگشت")) {
     sessions.delete(user.id);
     await saveSettings(settings);
-    await sendUserMenu(user, settings, admin, "عملیات لغو شد.");
+    if (admin) await sendAdminAction(user, "عملیات لغو شد."); else await sendUserMenu(user, settings, admin, "عملیات لغو شد.");
     return;
   }
   if (await handleSession(settings, user, text, admin)) return;
@@ -614,13 +659,13 @@ async function handleUpdate(update: any) {
   }
   if (labelIs(text, "🔍 جستجو")) {
     sessions.set(user.id, { mode: "SEARCH", step: 0, answers: [] });
-    await sendMessage(user.chatId, "عبارت جستجو را ارسال کنید. برای لغو /cancel را بفرستید.");
+    await sendSessionPrompt(user, "عبارت جستجو را ارسال کنید.", admin);
     return;
   }
   if (cmd?.name === "/support" || labelIs(text, "📞 پشتیبانی", "🎫 ثبت تیکت", "ثبت تیکت")) {
     const body = cmd?.args || "";
     sessions.set(user.id, { mode: "SUPPORT", step: 0, answers: [] });
-    if (body) await handleSession(settings, user, body, admin); else await sendMessage(user.chatId, "متن پیام پشتیبانی را ارسال کنید. برای لغو /cancel را بفرستید.");
+    if (body) await handleSession(settings, user, body, admin); else await sendSessionPrompt(user, "متن پیام پشتیبانی را ارسال کنید.", admin);
     return;
   }
   if (labelIs(text, "📚 سوالات متداول")) {
@@ -631,22 +676,32 @@ async function handleUpdate(update: any) {
   if (labelIs(text, "📝 تکمیل فرم")) {
     const questions = settings.formQuestions.length ? settings.formQuestions : defaultFormQuestions();
     sessions.set(user.id, { mode: "FORM", step: 0, answers: [] });
-    await sendMessage(user.chatId, "فرم شروع شد. برای لغو /cancel را بفرستید.\n\nسوال 1 از " + questions.length + ":\n" + questions[0]);
+    await sendSessionPrompt(user, "فرم شروع شد.\n\nسوال 1 از " + questions.length + ":\n" + questions[0], admin);
     return;
   }
   if (labelIs(text, "📅 رزرو وقت")) {
     sessions.set(user.id, { mode: "RESERVATION", step: 0, answers: [] });
-    await sendMessage(user.chatId, "خدمت موردنظر را ارسال کنید:\n" + settings.reservationServices.map(function(s, i) { return String(i + 1) + ". " + s; }).join("\n"));
+    await sendSessionPrompt(user, "خدمت موردنظر را ارسال کنید:\n" + settings.reservationServices.map(function(s, i) { return String(i + 1) + ". " + s; }).join("\n"), admin);
     return;
   }
   if (labelIs(text, "🧾 ثبت سفارش")) {
     sessions.set(user.id, { mode: "ORDER", step: 0, answers: [] });
-    await sendMessage(user.chatId, "برای ثبت سفارش، شماره یا نام محصول/خدمت را ارسال کنید:\n\n" + listItems(settings));
+    await sendSessionPrompt(user, "برای ثبت سفارش، شماره یا نام محصول/خدمت را ارسال کنید:\n\n" + listItems(settings), admin);
     return;
   }
   if (labelIs(text, "🔔 عضویت اطلاع‌رسانی")) {
     await saveSettings(settings);
     await sendUserMenu(user, settings, admin, "عضویت شما در اطلاع‌رسانی ثبت شد ✅");
+    return;
+  }
+  if (labelIs(text, "💳 پرداخت")) {
+    await saveSettings(settings);
+    await sendUserMenu(user, settings, admin, paymentText(settings));
+    return;
+  }
+  if (admin && labelIs(text, "💳 تنظیم کارت‌به‌کارت")) {
+    sessions.set(user.id, { mode: "SET_CARD", step: 0, answers: [] });
+    await sendSessionPrompt(user, "شماره کارت و نام صاحب کارت را ارسال کنید.\nفرمت پیشنهادی:\n6037xxxxxxxxxxxx | نام صاحب کارت\n\nبرای غیرفعال کردن، بنویسید: حذف", admin);
     return;
   }
   if (admin && (cmd?.name === "/admin" || labelIs(text, "⚙️ پنل مدیریت"))) {
@@ -656,72 +711,66 @@ async function handleUpdate(update: any) {
   }
   if (admin && (cmd?.name === "/stats" || labelIs(text, "📊 آمار"))) {
     await saveSettings(settings);
-    await sendAdminPanel(user, settings);
-    await sendMessage(user.chatId, "آمار:\nکاربران: " + settings.users.length + "\nتیکت‌ها: " + settings.tickets.length + "\nسفارش‌ها: " + settings.shopOrders.length + "\nفرم‌ها: " + settings.formResponses.length + "\nرزروها: " + settings.reservations.length + "\nمحتوا/محصول: " + (settings.items.length + settings.mediaItems.length) + "\nقالب: " + TEMPLATE_CODE + "\nامکانات: " + (FEATURES.length ? FEATURES.join("، ") : "ندارد"));
+    await sendAdminAction(user, "آمار:\nکاربران: " + settings.users.length + "\nتیکت‌ها: " + settings.tickets.length + "\nسفارش‌ها: " + settings.shopOrders.length + "\nفرم‌ها: " + settings.formResponses.length + "\nرزروها: " + settings.reservations.length + "\nمحتوا/محصول: " + (settings.items.length + settings.mediaItems.length) + "\nقالب: " + TEMPLATE_CODE + "\nامکانات: " + (FEATURES.length ? FEATURES.join("، ") : "ندارد"));
     return;
   }
   if (admin && labelIs(text, "👥 کاربران")) {
     await saveSettings(settings);
-    await sendAdminPanel(user, settings);
-    await sendMessage(user.chatId, "کاربران:\n\n" + listUsers(settings));
+    await sendAdminAction(user, "کاربران:\n\n" + listUsers(settings));
     return;
   }
   if (admin && (cmd?.name === "/tickets" || labelIs(text, "🎫 تیکت‌ها"))) {
     await saveSettings(settings);
     const list = settings.tickets.slice(-10).reverse().map(function(t) { return t.id + " | " + t.status + " | " + t.userId + "\n" + t.text; }).join("\n\n") || "تیکتی ثبت نشده است.";
-    await sendAdminPanel(user, settings);
-    await sendMessage(user.chatId, "آخرین تیکت‌ها:\n\n" + list + "\n\nپاسخ: /reply TICKET_ID متن");
+    await sendAdminAction(user, "آخرین تیکت‌ها:\n\n" + list + "\n\nپاسخ: /reply TICKET_ID متن");
     return;
   }
   if (admin && (cmd?.name === "/orders" || labelIs(text, "🧾 سفارش‌ها"))) {
     await saveSettings(settings);
     const list = settings.shopOrders.slice(-10).reverse().map(function(o) { return o.id + " | " + o.status + " | " + o.itemTitle + " | " + o.contact; }).join("\n") || "سفارشی ثبت نشده است.";
-    await sendAdminPanel(user, settings);
-    await sendMessage(user.chatId, "آخرین سفارش‌ها:\n" + list);
+    await sendAdminAction(user, "آخرین سفارش‌ها:\n" + list);
     return;
   }
   if (admin && (cmd?.name === "/forms" || labelIs(text, "📝 فرم‌ها"))) {
     await saveSettings(settings);
     const list = settings.formResponses.slice(-10).reverse().map(function(f) { return f.id + " | " + f.userId + " | " + f.answers.join(" / "); }).join("\n") || "فرمی ثبت نشده است.";
-    await sendAdminPanel(user, settings);
-    await sendMessage(user.chatId, "آخرین فرم‌ها:\n" + list);
+    await sendAdminAction(user, "آخرین فرم‌ها:\n" + list);
     return;
   }
   if (admin && (cmd?.name === "/reservations" || labelIs(text, "📅 رزروها"))) {
     await saveSettings(settings);
     const list = settings.reservations.slice(-10).reverse().map(function(r) { return r.id + " | " + r.status + " | " + r.service + " | " + r.requestedTime + " | " + r.contact; }).join("\n") || "رزروی ثبت نشده است.";
-    await sendAdminPanel(user, settings);
-    await sendMessage(user.chatId, "آخرین رزروها:\n" + list);
+    await sendAdminAction(user, "آخرین رزروها:\n" + list);
     return;
   }
   if (admin && (cmd?.name === "/broadcast" || labelIs(text, "📨 پیام همگانی"))) {
     const msg = cmd?.args || "";
     sessions.set(user.id, { mode: "BROADCAST", step: 0, answers: [] });
-    if (msg) await handleSession(settings, user, msg, admin); else await sendMessage(user.chatId, "متن پیام همگانی را ارسال کنید. برای لغو /cancel را بفرستید.");
+    if (msg) await handleSession(settings, user, msg, admin); else await sendSessionPrompt(user, "متن پیام همگانی را ارسال کنید.", admin);
     return;
   }
   if (admin && (cmd?.name === "/welcome" || labelIs(text, "✏️ تغییر خوش‌آمد"))) {
     const msg = cmd?.args || "";
     if (msg) { settings.welcomeMessage = msg; await saveSettings(settings); await sendAdminPanel(user, settings); return; }
     sessions.set(user.id, { mode: "EDIT_WELCOME", step: 0, answers: [] });
-    await sendMessage(user.chatId, "متن خوش‌آمد جدید را ارسال کنید.");
+    await sendSessionPrompt(user, "متن خوش‌آمد جدید را ارسال کنید.", admin);
     return;
   }
   if (admin && (cmd?.name === "/item" || labelIs(text, "➕ افزودن محصول"))) {
     const line = cmd?.args || "";
     if (line) { settings.items.push(parseItemLine(line)); await saveSettings(settings); await sendAdminPanel(user, settings); return; }
     sessions.set(user.id, { mode: "ADD_ITEM", step: 0, answers: [] });
-    await sendMessage(user.chatId, "محصول/خدمت را با این فرمت ارسال کنید:\nعنوان | قیمت | دسته | موجودی | توضیح");
+    await sendSessionPrompt(user, "محصول/خدمت را با این فرمت ارسال کنید:\nعنوان | قیمت | دسته | موجودی | توضیح", admin);
     return;
   }
   if (admin && labelIs(text, "🗑 حذف محصول")) {
     sessions.set(user.id, { mode: "DELETE_ITEM", step: 0, answers: [] });
-    await sendMessage(user.chatId, "شماره محصول/خدمت را برای حذف ارسال کنید:\n\n" + listItems(settings));
+    await sendSessionPrompt(user, "شماره محصول/خدمت را برای حذف ارسال کنید:\n\n" + listItems(settings), admin);
     return;
   }
   if (admin && labelIs(text, "🎬 افزودن رسانه")) {
     sessions.set(user.id, { mode: "ADD_MEDIA", step: 0, answers: [] });
-    await sendMessage(user.chatId, "رسانه را با این فرمت ارسال کنید:\nعنوان | دسته | لینک | توضیح");
+    await sendSessionPrompt(user, "رسانه را با این فرمت ارسال کنید:\nعنوان | دسته | لینک | توضیح", admin);
     return;
   }
   if (admin && cmd?.name === "/reply") {
@@ -730,7 +779,7 @@ async function handleUpdate(update: any) {
     const reply = parts.join(" ").trim();
     const ticket = settings.tickets.find(function(t) { return t.id === ticketId; });
     if (!ticket) { await sendMessage(user.chatId, "تیکت پیدا نشد."); return; }
-    if (!reply) { sessions.set(user.id, { mode: "REPLY_TICKET", step: 0, answers: [ticketId], meta: { ticketId: ticketId } }); await sendMessage(user.chatId, "متن پاسخ تیکت " + ticketId + " را ارسال کنید."); return; }
+    if (!reply) { sessions.set(user.id, { mode: "REPLY_TICKET", step: 0, answers: [ticketId], meta: { ticketId: ticketId } }); await sendSessionPrompt(user, "متن پاسخ تیکت " + ticketId + " را ارسال کنید.", admin); return; }
     ticket.status = "ANSWERED";
     ticket.adminReply = reply;
     ticket.updatedAt = nowIso();
@@ -743,12 +792,12 @@ async function handleUpdate(update: any) {
     const id = faToEnDigits(cmd?.args || "").replace(/[^0-9]/g, "");
     if (id) { if (!settings.admins.includes(id)) settings.admins.push(id); await saveSettings(settings); await sendAdminPanel(user, settings); await sendMessage(user.chatId, "ادمین اضافه شد ✅\n" + id); return; }
     sessions.set(user.id, { mode: "ADD_ADMIN", step: 0, answers: [] });
-    await sendMessage(user.chatId, "شناسه عددی ادمین جدید را ارسال کنید.");
+    await sendSessionPrompt(user, "شناسه عددی ادمین جدید را ارسال کنید.", admin);
     return;
   }
   if (admin && labelIs(text, "🗑 حذف کاربر")) {
     sessions.set(user.id, { mode: "DELETE_USER", step: 0, answers: [] });
-    await sendMessage(user.chatId, "شناسه عددی کاربر را برای حذف ارسال کنید.\n\n" + listUsers(settings));
+    await sendSessionPrompt(user, "شناسه عددی کاربر را برای حذف ارسال کنید.\n\n" + listUsers(settings), admin);
     return;
   }
   if (text && !text.startsWith("/")) {
@@ -759,7 +808,7 @@ async function handleUpdate(update: any) {
   await saveSettings(settings);
   await sendUserMenu(user, settings, admin, "دستور شناخته نشد. از منوی زیر استفاده کنید.");
 }
-app.get("/health", function(_req, res) { res.json({ ok: true, platform: "BALE", phase: 68, template: TEMPLATE_CODE, bot: BALE_BOT_USERNAME || null, hasToken: Boolean(BALE_TOKEN), baseUrl: BASE_URL || null, webhookPath: "/bale/webhook/" + WEBHOOK_SECRET }); });
+app.get("/health", function(_req, res) { res.json({ ok: true, platform: "BALE", phase: 69, template: TEMPLATE_CODE, bot: BALE_BOT_USERNAME || null, hasToken: Boolean(BALE_TOKEN), baseUrl: BASE_URL || null, webhookPath: "/bale/webhook/" + WEBHOOK_SECRET }); });
 app.get("/", function(_req, res) { res.type("html").send("<h1>" + BUSINESS_NAME + "</h1><p>بازوی بله فعال است.</p><p>برای استفاده داخل بله /start را ارسال کنید.</p><p><a href='/health'>Health</a></p>"); });
 app.get("/bale/setup", function(_req, res) { res.type("text").send("برای مدیریت بازو داخل بله /start بزنید. اگر مدیریت خودکار فعال است، دستور /claim را با کد تحویل‌شده ارسال کنید."); });
 app.post("/bale/webhook/" + WEBHOOK_SECRET, async function(req, res) {
