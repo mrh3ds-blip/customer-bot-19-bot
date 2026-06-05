@@ -4,8 +4,8 @@ import express from "express";
 import { promises as fs } from "fs";
 import crypto from "crypto";
 
-// Generated Bale bot - Phase 69
-// Real menu-based Bale bot with cleaner admin UX, card-to-card payment, cancel/back controls and copy-friendly claim flow.
+// Generated Bale bot - Phase 73
+// Fixes reservation service leakage: internal template JSON is never shown as customer-facing reservation services.
 
 type StoredUser = { id: string; chatId: string; firstName?: string; username?: string; phone?: string; lastSeen: string; createdAt?: string };
 type Ticket = { id: string; userId: string; chatId: string; text: string; status: "OPEN" | "ANSWERED" | "CLOSED"; createdAt: string; updatedAt?: string; adminReply?: string };
@@ -56,29 +56,7 @@ const FEATURE_CODES = [
   "MULTI_ADMIN",
   "CARD_TO_CARD"
 ];
-const DETAIL_LINES = [
-  "{",
-  "\"mode\": \"options\",",
-  "\"template\": \"BALE_RESERVATION\",",
-  "\"platform\": \"BALE\",",
-  "\"flags\": [",
-  "\"adminPanel\",",
-  "\"reports\",",
-  "\"payments\",",
-  "\"broadcast\"",
-  "],",
-  "\"flagTitles\": [",
-  "\"🧰 پنل مدیریت\",",
-  "\"📊 گزارش‌گیری\",",
-  "\"💳 پرداخت\",",
-  "\"📣 پیام همگانی\"",
-  "],",
-  "\"categories\": [],",
-  "\"contentModel\": \"FREE\",",
-  "\"autoDeleteSeconds\": 0,",
-  "\"raw\": \"قالب: رزرو / نوبت‌دهی بله\\nپلتفرم: 💬 بازوی بله\\nامکانات انتخاب‌شده: 🧰 پنل مدیریت، 📊 گزارش‌گیری، 💳 پرداخت، 📣 پیام همگانی\"",
-  "}"
-];
+const DETAIL_LINES = [];
 const DETAIL_SPEC = {
   "mode": "options",
   "template": "BALE_RESERVATION",
@@ -160,6 +138,47 @@ function uniqueTexts(items: string[]) {
   }
   return out;
 }
+function stripLeadingNumberPrefix(value: string) {
+  let text = compact(value);
+  const normalized = faToEnDigits(text);
+  const dotIndex = normalized.indexOf(".");
+  if (dotIndex > 0 && dotIndex <= 3) {
+    const prefix = normalized.slice(0, dotIndex);
+    if (prefix.split("").every(function(ch) { return ch >= "0" && ch <= "9"; })) {
+      text = text.slice(dotIndex + 1).trim();
+    }
+  }
+  return text;
+}
+function isOnlyJsonPunctuation(text: string) {
+  const chars = String(text || "").trim().split("");
+  if (!chars.length) return true;
+  return chars.every(function(ch) { return ["{", "}", "[", "]", ",", ":", "\"", "'"].includes(ch); });
+}
+function looksLikeInternalConfig(value: any) {
+  const text = stripLeadingNumberPrefix(String(value || "").trim());
+  if (!text) return true;
+  if (text.startsWith("{") || text.startsWith("[") || text.startsWith("}") || text.startsWith("]") || text.startsWith('"')) return true;
+  if (isOnlyJsonPunctuation(text)) return true;
+  const normalized = text.replaceAll('"', "").replaceAll("'", "").trim();
+  const keys = ["mode", "template", "platform", "flags", "flagTitles", "categories", "contentModel", "autoDeleteSeconds", "raw"];
+  for (const key of keys) {
+    if (normalized.startsWith(key + ":") || normalized.startsWith(key + " =") || normalized.startsWith(key + "=")) return true;
+  }
+  if (text.includes('"mode"') || text.includes('"template"') || text.includes('"platform"') || text.includes('"flags"')) return true;
+  if (text.includes("قالب:") && text.includes("پلتفرم:")) return true;
+  return false;
+}
+function cleanReservationServices(values: any[]) {
+  const cleaned = uniqueTexts((values || []).map(function(v) {
+    let text = stripLeadingNumberPrefix(String(v || ""));
+    if (text.includes("|")) text = text.split("|")[0].trim();
+    return text;
+  }).filter(function(text) {
+    return text && !looksLikeInternalConfig(text) && text.length <= 80;
+  }));
+  return cleaned.length ? cleaned : ["مشاوره", "رزرو وقت حضوری", "رزرو وقت آنلاین"];
+}
 function defaultItems(): Item[] {
   if (TEMPLATE_CODE === "BALE_FORM" || TEMPLATE_CODE === "BALE_RESERVATION" || TEMPLATE_CODE === "BALE_BROADCAST") return [];
   const fromSpec = Array.isArray(DETAIL_SPEC?.items) ? DETAIL_SPEC.items.map(function(x: any) { return String(x); }) : [];
@@ -180,8 +199,14 @@ function defaultFormQuestions() {
 }
 function defaultReservationServices() {
   if (TEMPLATE_CODE !== "BALE_RESERVATION") return ["مشاوره", "رزرو وقت", "پیگیری سفارش"];
-  const services = uniqueTexts((DETAIL_LINES || []).map(function(line) { return String(line).split("|")[0].trim(); }));
-  return services.length ? services : ["مشاوره", "رزرو وقت حضوری", "رزرو وقت آنلاین"];
+  const specServices = Array.isArray(DETAIL_SPEC?.reservationServices)
+    ? DETAIL_SPEC.reservationServices
+    : Array.isArray(DETAIL_SPEC?.services)
+      ? DETAIL_SPEC.services
+      : Array.isArray(DETAIL_SPEC?.items)
+        ? DETAIL_SPEC.items
+        : [];
+  return cleanReservationServices(specServices.concat(DETAIL_LINES || []));
 }
 function defaultMediaCategories() {
   if (Array.isArray(DETAIL_SPEC?.categories) && DETAIL_SPEC.categories.length) return uniqueTexts(DETAIL_SPEC.categories.map(function(x: any) { return String(x); }));
@@ -242,7 +267,7 @@ async function loadSettings(): Promise<Settings> {
       shopOrders: Array.isArray(parsed.shopOrders) ? parsed.shopOrders : [],
       formQuestions: Array.isArray(parsed.formQuestions) && parsed.formQuestions.length ? parsed.formQuestions : base.formQuestions,
       formResponses: Array.isArray(parsed.formResponses) ? parsed.formResponses : [],
-      reservationServices: Array.isArray(parsed.reservationServices) && parsed.reservationServices.length ? parsed.reservationServices : base.reservationServices,
+      reservationServices: Array.isArray(parsed.reservationServices) && parsed.reservationServices.length ? cleanReservationServices(parsed.reservationServices) : base.reservationServices,
       reservations: Array.isArray(parsed.reservations) ? parsed.reservations : [],
       mediaCategories: Array.isArray(parsed.mediaCategories) ? parsed.mediaCategories : base.mediaCategories,
       mediaItems: Array.isArray(parsed.mediaItems) ? parsed.mediaItems : [],
@@ -323,8 +348,8 @@ function adminRows() {
     ["📝 فرم‌ها", "📅 رزروها"],
     ["➕ افزودن محصول", "🗑 حذف محصول"],
     ["🎬 افزودن رسانه", "📨 پیام همگانی"],
-    ["💳 تنظیم کارت‌به‌کارت", "✏️ تغییر خوش‌آمد"],
-    ["➕ افزودن ادمین"],
+    ["💳 پرداخت", "💳 تنظیم کارت به کارت"],
+    ["✏️ تغییر خوش‌آمد", "➕ افزودن ادمین"],
     ["🗑 حذف کاربر", "🏠 منوی اصلی"]
   ];
 }
@@ -347,10 +372,17 @@ async function sendAdminAction(user: any, text: string) {
   await sendMenu(user.id, user.chatId, text, adminRows());
 }
 function sessionRows(admin: boolean) {
-  return admin ? [["↩️ بازگشت", "❌ انصراف"], ["⚙️ پنل مدیریت", "🏠 منوی اصلی"]] : [["↩️ بازگشت", "❌ انصراف"], ["🏠 منوی اصلی"]];
+  return admin
+    ? [["❌ انصراف", "↩️ بازگشت"], ["⚙️ پنل مدیریت", "🏠 منوی اصلی"]]
+    : [["❌ انصراف", "↩️ بازگشت"], ["🏠 منوی اصلی"]];
 }
 async function sendSessionPrompt(user: any, text: string, admin: boolean) {
-  await sendMenu(user.id, user.chatId, text + "\n\nبرای لغو یا برگشت از دکمه‌های زیر استفاده کنید.", sessionRows(admin));
+  await sendMenu(
+    user.id,
+    user.chatId,
+    text + "\n\nبرای لغو، یکی از این موارد را بفرستید یا دکمه را بزنید:\n0 / انصراف / بازگشت",
+    sessionRows(admin)
+  );
 }
 function paymentText(settings: Settings) {
   const lines: string[] = ["💳 روش پرداخت"];
@@ -402,7 +434,17 @@ function parseCommand(text: string) {
   return { name: "/" + String(match[1] || "").toLowerCase(), args: String(match[2] || "").trim() };
 }
 function isAdmin(settings: Settings, userId: string) { return settings.admins.map(String).includes(String(userId)); }
-function labelIs(text: string, ...labels: string[]) { return labels.includes(compact(text)); }
+function normalizeLabel(value: string) {
+  return compact(value)
+    .replace(/\u200c/g, " ")
+    .replace(/[ـ_\-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function labelIs(text: string, ...labels: string[]) {
+  const normalized = normalizeLabel(text);
+  return labels.some(function(label) { return normalizeLabel(label) === normalized; });
+}
 async function rememberUser(settings: Settings, user: { id: string; chatId: string; firstName?: string; username?: string }) {
   if (!user.id) return;
   const existing = settings.users.find(function(u) { return String(u.id) === String(user.id); });
@@ -444,9 +486,19 @@ async function notifyAdmins(settings: Settings, text: string) {
 async function handleSession(settings: Settings, user: any, text: string, admin: boolean) {
   const session = sessions.get(user.id);
   if (!session) return false;
-  if (labelIs(text, "لغو", "/cancel", "انصراف", "❌ انصراف", "↩️ بازگشت", "بازگشت")) {
+  if (labelIs(text, "0", "لغو", "/cancel", "انصراف", "❌ انصراف", "↩️ بازگشت", "بازگشت", "برگشت")) {
     sessions.delete(user.id);
     if (admin) await sendAdminAction(user, "عملیات لغو شد."); else await sendUserMenu(user, settings, admin, "عملیات لغو شد.");
+    return true;
+  }
+  if (admin && labelIs(text, "⚙️ پنل مدیریت", "پنل مدیریت")) {
+    sessions.delete(user.id);
+    await sendAdminPanel(user, settings);
+    return true;
+  }
+  if (labelIs(text, "🏠 منوی اصلی", "منوی اصلی", "شروع")) {
+    sessions.delete(user.id);
+    if (admin) await sendAdminAction(user, "به منوی اصلی برگشتید."); else await sendUserMenu(user, settings, admin, "به منوی اصلی برگشتید.");
     return true;
   }
   if (session.mode === "SUPPORT") {
@@ -536,7 +588,7 @@ async function handleSession(settings: Settings, user: any, text: string, admin:
   }
   if (session.mode === "SET_CARD") {
     const value = compact(text);
-    if (/^(حذف|پاک|خاموش|off)$/i.test(value)) {
+    if (/^(حذف|پاک|خاموش|off)$/i.test(normalizeLabel(value))) {
       settings.payment.cardNumber = "";
       settings.payment.cardHolder = "";
       settings.payment.note = "بعد از پرداخت، رسید پرداخت را برای پشتیبانی ارسال کنید.";
@@ -625,7 +677,7 @@ async function handleUpdate(update: any) {
     await sendMessage(user.chatId, "مدیریت بازوی بله برای این حساب فعال شد ✅");
     return;
   }
-  if (cmd?.name === "/cancel" || labelIs(text, "انصراف", "لغو", "❌ انصراف", "↩️ بازگشت", "بازگشت")) {
+  if (cmd?.name === "/cancel" || labelIs(text, "0", "انصراف", "لغو", "❌ انصراف", "↩️ بازگشت", "بازگشت", "برگشت")) {
     sessions.delete(user.id);
     await saveSettings(settings);
     if (admin) await sendAdminAction(user, "عملیات لغو شد."); else await sendUserMenu(user, settings, admin, "عملیات لغو شد.");
@@ -694,14 +746,14 @@ async function handleUpdate(update: any) {
     await sendUserMenu(user, settings, admin, "عضویت شما در اطلاع‌رسانی ثبت شد ✅");
     return;
   }
-  if (labelIs(text, "💳 پرداخت")) {
+  if (labelIs(text, "💳 پرداخت", "پرداخت", "کارت به کارت", "کارت‌به‌کارت")) {
     await saveSettings(settings);
     await sendUserMenu(user, settings, admin, paymentText(settings));
     return;
   }
-  if (admin && labelIs(text, "💳 تنظیم کارت‌به‌کارت")) {
+  if (admin && labelIs(text, "💳 تنظیم کارت‌به‌کارت", "💳 تنظیم کارت به کارت", "تنظیم کارت به کارت", "کارت به کارت", "کارت‌به‌کارت")) {
     sessions.set(user.id, { mode: "SET_CARD", step: 0, answers: [] });
-    await sendSessionPrompt(user, "شماره کارت و نام صاحب کارت را ارسال کنید.\nفرمت پیشنهادی:\n6037xxxxxxxxxxxx | نام صاحب کارت\n\nبرای غیرفعال کردن، بنویسید: حذف", admin);
+    await sendSessionPrompt(user, "شماره کارت و نام صاحب کارت را ارسال کنید.\nفرمت پیشنهادی:\n6037xxxxxxxxxxxx | نام صاحب کارت\n\nبرای غیرفعال کردن کارت‌به‌کارت، بنویسید: حذف", admin);
     return;
   }
   if (admin && (cmd?.name === "/admin" || labelIs(text, "⚙️ پنل مدیریت"))) {
@@ -808,7 +860,7 @@ async function handleUpdate(update: any) {
   await saveSettings(settings);
   await sendUserMenu(user, settings, admin, "دستور شناخته نشد. از منوی زیر استفاده کنید.");
 }
-app.get("/health", function(_req, res) { res.json({ ok: true, platform: "BALE", phase: 69, template: TEMPLATE_CODE, bot: BALE_BOT_USERNAME || null, hasToken: Boolean(BALE_TOKEN), baseUrl: BASE_URL || null, webhookPath: "/bale/webhook/" + WEBHOOK_SECRET }); });
+app.get("/health", function(_req, res) { res.json({ ok: true, platform: "BALE", phase: 73, template: TEMPLATE_CODE, bot: BALE_BOT_USERNAME || null, hasToken: Boolean(BALE_TOKEN), baseUrl: BASE_URL || null, webhookPath: "/bale/webhook/" + WEBHOOK_SECRET }); });
 app.get("/", function(_req, res) { res.type("html").send("<h1>" + BUSINESS_NAME + "</h1><p>بازوی بله فعال است.</p><p>برای استفاده داخل بله /start را ارسال کنید.</p><p><a href='/health'>Health</a></p>"); });
 app.get("/bale/setup", function(_req, res) { res.type("text").send("برای مدیریت بازو داخل بله /start بزنید. اگر مدیریت خودکار فعال است، دستور /claim را با کد تحویل‌شده ارسال کنید."); });
 app.post("/bale/webhook/" + WEBHOOK_SECRET, async function(req, res) {
